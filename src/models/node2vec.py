@@ -27,3 +27,4 @@ def build_node2vec(edge_index: torch.Tensor, **hparams: Any):
     """
     model = Node2Vec(edge_index=edge_index, **hparams)
     return model
+

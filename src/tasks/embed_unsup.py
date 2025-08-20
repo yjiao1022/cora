@@ -17,12 +17,13 @@ python -m src.tasks.embed_unsup --method node2vec --embedding_dim 128 \
     --walk_length 20 --context_size 10 --walks_per_node 10 --neg_samples 1 --lr 0.01
 
 # DGI (Deep Graph Infomax) with a tiny GCN encoder
-python -m src.tasks.embed_unsup --method dgi --epochs 300 --lr 0.001 --hid 64 --dropout 0.5
+python -m src.tasks.embed_unsup --method dgi --epochs 300 --dgi_lr 0.001 --hid 64 --dropout 0.5
 """
 
 from __future__ import annotations
 import os, argparse
 from typing import Tuple
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,8 @@ from torch_geometric.transforms import NormalizeFeatures
 from sklearn.manifold import TSNE
 
 from src.models.node2vec import build_node2vec
+from src.models.dgi import SmallGCNEncoder
+from src.models.dgi import build_dgi
 
 try:
     import umap  # type: ignore
@@ -50,6 +53,13 @@ def _device_auto() -> torch.device:
         return torch.device("cuda")
     else:
         return torch.device("cpu")
+
+def _to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 def train_node2vec(
     edge_index: torch.Tensor,
@@ -85,14 +95,6 @@ def train_node2vec(
     Returns:
         emb : Tensor [N, embedding_dim]
             The learned embeddings (detached on CPU).
-
-    TODO(you):
-        - Instantiate torch_geometric.nn.models.Node2Vec with the hyperparameters above.
-        - Choose optimizer: SparseAdam if sparse=True, else Adam.
-        - Training loop: for epoch in 1..epochs:
-              loss = model.loss()
-              backward + step
-        - Return model.embedding.weight.detach().cpu()
     """
     device = torch.device("cpu") # <- MPS backend does not support sparse gradient yet
 
@@ -116,11 +118,48 @@ def train_node2vec(
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        if epoch % 10 ==0:
+        if epoch % 20 == 0:
             print(f"Epoch {epoch:03d}, Loss: {total_loss:.4f}")
 
     emb = model.embedding.weight.detach().cpu()
     return emb
+
+def train_dgi(data, *, hid=64, dropout=0.0, epochs=300, lr=0.001) -> torch.Tensor:
+    """
+    Train Deep Graph Infomax and return [N, hid] embeddings (CPU).
+    """
+    device=_device_auto()
+    data = data.to(device)
+
+    encoder = SmallGCNEncoder(in_dim=data.num_features, hid=hid, dropout=dropout).to(device)
+    dgi = build_dgi(encoder, hidden_channels=hid).to(device)
+    opt = torch.optim.Adam(dgi.parameters(), lr=lr)
+
+    for epoch in range(1, epochs + 1):
+        dgi.train()
+        opt.zero_grad(set_to_none=True)
+        # positive, negative embedding, and global context vector
+        pos_z, neg_z, summary = dgi(data.x, data.edge_index)
+        loss = dgi.loss(pos_z, neg_z, summary)
+        loss.backward()
+        opt.step()
+
+        if epoch % 20 == 0:
+            with torch.no_grad():
+                # Average embedding norm
+                emb_norm = pos_z.norm(dim=1).mean().item()
+
+                # Discriminator scores (dot product with summary)
+                pos_score = torch.sigmoid((pos_z * summary).sum(dim=1)).mean().item()
+                neg_score = torch.sigmoid((neg_z * summary).sum(dim=1)).mean().item()
+
+            print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | "
+                f"||z||: {emb_norm:.2f} | pos_score: {pos_score:.2f}, neg_score: {neg_score:.2f}")
+
+    dgi.eval()
+    with torch.no_grad():
+        z = encoder(data.x, data.edge_index).detach()
+    return z
 
 
 def linear_probe(emb: torch.Tensor, labels: torch.Tensor, train_mask: torch.Tensor,
@@ -129,10 +168,20 @@ def linear_probe(emb: torch.Tensor, labels: torch.Tensor, train_mask: torch.Tens
     """
     Train a single linear layer on frozen embeddings to predict the class labels.
     """
+    device = _device_auto()
     torch.manual_seed(seed)
+
+    emb = emb.to(device)
+    labels = labels.to(device).long()
+    train_mask = train_mask.to(device).bool()
+    val_mask   = val_mask.to(device).bool()
+    test_mask  = test_mask.to(device).bool()
+
     D = emb.size()[1]
     C = int(labels.max().item()) + 1
-    clf = nn.Linear(D, C)
+
+    clf = nn.Linear(D, C).to(device)
+
     opt = torch.optim.Adam(clf.parameters(), lr=lr, weight_decay=wd)
     best_val, best_state = -1.0, {k: v.detach().clone() for k,v in clf.state_dict().items()}
     for _ in range(1, epochs + 1):
@@ -172,17 +221,19 @@ def plot_tsne(emb: torch.Tensor, labels: torch.Tensor, save_path: str=None) -> N
     """
     t‑SNE → 2D scatter.
     """
-    Z2 = TSNE(n_components=2, perplexity=30, learning_rate='auto', init='pca').fit_transform(emb.numpy())
-    _scatter_2d(Z2, labels.cpu().numpy(), "t-SNE", save_path)
-
-
+    emb = _to_numpy(emb)
+    labels = _to_numpy(labels)
+    Z2 = TSNE(n_components=2, perplexity=30, learning_rate='auto', init='pca').fit_transform(emb)
+    _scatter_2d(Z2, labels, "t-SNE", save_path)
 
 def plot_umap(emb: torch.Tensor, labels: torch.Tensor, save_path: str=None) -> None:
     """
     UMAP → 2D scatter.
     """
-    Z2 = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1).fit_transform(emb.numpy())
-    _scatter_2d(Z2, labels.cpu().numpy(), "UMAP", save_path)
+    emb = _to_numpy(emb)
+    labels = _to_numpy(labels)     
+    Z2 = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1).fit_transform(emb)
+    _scatter_2d(Z2, labels, "UMAP", save_path)
 
 
 def main():
@@ -199,6 +250,10 @@ def main():
     parser.add_argument("--p", type=float, default=1.0)
     parser.add_argument("--q", type=float, default=1.0)
     parser.add_argument("--n2v_lr", type=float, default=0.01)
+    # DGI
+    parser.add_argument("--hid", type=int, default=64)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dgi_lr", type=float, default=0.001)
 
     args = parser.parse_args()
     torch.manual_seed(args.seed)
@@ -212,6 +267,8 @@ def main():
             num_negative_samples=args.neg_samples, p=args.p, q=args.q,
             epochs=args.epochs, lr=args.n2v_lr, sparse=True
         )
+    else:
+        emb = train_dgi(data, hid=args.hid, dropout=args.dropout, epochs=args.epochs, lr=args.dgi_lr)
 
     os.makedirs("results/embeds", exist_ok=True)
     torch.save(emb, "results/embeds/embeddings.pt")
