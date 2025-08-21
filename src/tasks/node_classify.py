@@ -80,7 +80,7 @@ def train_model(
     device = _device_auto()
     data = data.to(device)
     # (MPS tip) keep features in float32
-    data.x = data.x.to(torch.float32)    
+    data.x = data.x.to(torch.float32)
 
     # Model
     model = model_cls(in_dim=data.num_node_features, out_dim=ds.num_classes, **hparams).to(device)
